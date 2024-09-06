@@ -1,0 +1,508 @@
+## LightGBM
+
+### Data Preparation
+
+First, the data are prepared for LightGBM. LightGBM expects matrices for its inputs. Thereafter, the LightGBM model is trained. Factors are recast as their underlying integer indices.
+
+```{r lgbm-data-prep, echo = FALSE, message = FALSE, warning = FALSE}
+## convert all columns to numeric
+train_lgbm <- copy(train)
+test_lgbm <- copy(test)
+
+train_lgbm[,
+           (factor_cols):=lapply(.SD,as.numeric),
+           .SDcols=factor_cols]
+test_lgbm[,
+           (factor_cols):=lapply(.SD,as.numeric),
+           .SDcols=factor_cols]
+
+## create matrix versions of x,y, weight with numeric values
+train.x.lgbm         <- as.matrix(train_lgbm[,..pred_cols])
+train.y.lgbm         <- as.matrix(train_lgbm[,..resp_var])
+train.weight.lgbm    <- as.matrix(train_lgbm[,..resp_offset])
+
+test.x.lgbm         <- as.matrix(test_lgbm[,..pred_cols])
+test.y.lgbm         <- as.matrix(test_lgbm[,..resp_var])
+test.weight.lgbm    <- as.matrix(test_lgbm[,..resp_offset])
+
+rm(train_lgbm,test_lgbm)
+```
+
+### Model Fitting
+
+The LightGBM model is fit to the training subset using a Poisson objective. The model response is the ratio of response variable and response offset, and the weights are the specified offset. Often, this might be "actual claims" as the response and "expected claims" as the offset.
+
+```{r lgbm}
+#==============================================================================#
+#### Section 5: lightgbm ####
+#==============================================================================#
+
+#### Notes
+## Helpful Resources:
+## https://lightgbm.readthedocs.io/en/v3.3.2/
+## https://christophm.github.io/interpretable-ml-book/shapley.html
+
+## In this section we fit a lightgbm model, an implementation of gradient 
+## boosting machines. We also extract interaction feature importance
+## This is a way to determine most likely interactions for a linear model
+## We also look at Shapley values which can be useful to decompose black-box 
+## model predictions
+
+#-----------------------------------------#
+##### Fit model and make predictions #####
+#-----------------------------------------#
+
+## create lgbm dataset
+lgbm.train <- lgb.Dataset(train.x.lgbm, 
+                   label  = train.y.lgbm/train.weight.lgbm, 
+                   weight = train.weight.lgbm)
+
+lgbm.test <- lgb.Dataset.create.valid(lgbm.train,
+                                      test.x.lgbm,
+                                      label=test.y.lgbm/test.weight.lgbm)
+
+## define parameters
+params <- list(
+          objective = "poisson",
+          metric = "poisson",
+          min_data_in_leaf = 500,
+          learning_rate = .3,
+          feature_fraction = .75,
+          bagging_fraction = 0.50,
+          seed = nGBMSeed
+)
+
+## train model 
+if(bUseCache & file.exists(
+  paste0(cacheFileRoot,"_lgb_model.txt")
+  ) & !bInvalidateCaches)
+{
+  lgbm1 <- lgb.load(paste0(cacheFileRoot,"_lgb_model.txt"))
+} else {
+  lgbm1 <- lgb.train(
+           params = params,
+           data = lgbm.train,
+           nrounds = 2000L#,  ## for demo purposes; switch back to 2000
+           #valids=list(test=lgbm.test),
+           #early_stopping_rounds = 10
+           )
+  if(bUseCache)
+    lgb.save(lgbm1,paste0(cacheFileRoot,"_lgb_model.txt"))
+}
+
+## generate predictions
+## note: predictions needed to be multiplied by weights, linear models do this automatically
+test[,predictions_lgbm1:=predict(lgbm1, test.x.lgbm) * get(resp_offset)]
+train[,predictions_lgbm1:=predict(lgbm1, train.x.lgbm) * get(resp_offset)]
+```
+
+### Model Illustrations and Graphics {.tabset}
+
+From this, we can plot decile lift and Lorenz curves.
+
+The decile lift plot can be interpreted as a way to visualize the effectiveness of a predictive model. It divides the data into ten parts (deciles) based on the model's predictions, from the highest probability of an event occurring to the lowest. The steeper the plot against deciles, the better the segmentation or lift. We see three lines. The "table" line indicates that the expected mortality is relatively constant across these model deciles even though the "actual" mortality and the mortality predicted by the "model" vary substantially, indicating significant risk stratification. 
+
+The Lorenz curve describes is another way of visualizing the risk stratification of the model. The more bowed the line is from the y=x axis, the greater the Gini coefficient and the greater the risk stratification. 
+
+Understanding the behavior of the interactions as well as gain and cover can give us some macro insight into what the model is doing. The feature interaction table ranks and demonstrates the most important interactions in the model. 'gain' refers to the improvement in accuracy brought by a feature to the branches it is on, thus indicating the feature is important.  'cover' measures the number of times a feature is used to split the data across all trees regardless of the gain in accuracy achieved. A high gain with a high cover suggests a feature that is very useful across many parts of the dataset. 
+
+#### Lift Curve
+
+```{r lgbm-metrics}
+#-----------------------------------------#
+##### Validation Metrics #####
+#-----------------------------------------#
+
+## generate plot
+test[,decile.table(get(resp_var),predictions_lgbm1/get(resp_offset),
+                   get(resp_offset))] %>%
+  pivot_longer(-c(decile,exposures)) %>% 
+  as.data.table() %>%
+  ggplot(aes(x=decile, y=value, col=name)) +  
+  geom_line() +
+  scale_x_continuous(breaks=c(1:10)) +
+  labs(x="Decile",y="Response")+
+  ggtitle("Decile Lift Plot") +
+  theme_minimal() +
+  scale_y_continuous(labels=scales::comma)
+```
+
+
+#### Lorenz Curve
+
+```{r lgbm-metrics-lorenz} 
+## lorenz plot
+test[,lorenz(get(resp_var), predictions_lgbm1 / get(resp_offset), 
+             get(resp_offset))]
+```
+
+#### Feature Importance
+
+The following plot is the feature importance plot which ranks the mean absolute SHAP value for a given feature. It should be noted that being low on the list does not automatically imply that a feature is unimportant. Due to phenomena such as aggregation bias, features with relatively higher numbers of levels can seemingly rank higher than those with lower numbers of levels. Here, the top three tend to have large numbers of levels versus the bottom four.
+
+```{r lgbm-feat-imp, out.width='90%'}
+#-----------------------------------------#
+##### Feature Importance #####
+#-----------------------------------------#
+
+## get most important features
+if(bUseCache & file.exists(
+  paste0(cacheFileRoot,"_lgb_imp.rds")
+  ) & !bInvalidateCaches) {
+  imp <- readRDS(paste0(cacheFileRoot,"_lgb_imp.rds"))
+} else {
+  imp <- lgb.importance(lgbm1, percentage = TRUE)
+  if(bUseCache)
+    saveRDS(imp,paste0(cacheFileRoot,"_lgb_imp.rds"))
+}
+
+## get most important interactions from EIX library
+## warning: very slow
+if(bUseCache & file.exists(
+  paste0(cacheFileRoot,"_lgb_imp_int.rds")
+  ) & !bInvalidateCaches) {
+  imp.int <- readRDS(paste0(cacheFileRoot,"_lgb_imp_int.rds"))
+} else {
+  imp.int <- importance(lgbm1, sm, option = "interactions")
+  if(bUseCache)
+    saveRDS(imp.int,paste0(cacheFileRoot,"_lgb_imp_int.rds"))
+}
+
+#-----------------------------------------#
+##### Shap Values #####
+#-----------------------------------------#
+
+## get shap values for lightgbm
+if(bUseCache & file.exists(
+  paste0(cacheFileRoot,"_lgb_shap.rds")
+  ) & !bInvalidateCaches) {
+  shap_lgbm <- readRDS(paste0(cacheFileRoot,"_lgb_shap.rds"))
+} else {
+  shap_lgbm <- as.data.table(
+    predict(lgbm1, 
+            test.x.lgbm, 
+            type="contrib"
+            #rawscore = FALSE, 
+            #predcontrib = TRUE
+            ) 
+    ) %>%
+    setnames(names(.),
+             c(colnames(test.x.lgbm),"BIAS")
+    )
+  shap_lgbm[,pred:=exp(Reduce('+',.SD))*test.weight.lgbm] ## reproduce model predictions
+  if(bUseCache)
+    saveRDS(shap_lgbm,paste0(cacheFileRoot,"_lgb_shap.rds"))
+}
+
+set.seed(1337)
+if(flgbm_vis_subset < 1 ) {
+  shp_int_subset <- sample.int(n=nrow(train),
+                             size=nrow(train)*flgbm_vis_subset)
+} else {
+  shp_int_subset <- 1:nrow(train)
+}
+
+if(bUseCache & file.exists(
+  paste0(cacheFileRoot,"_lgb_shapviz.rds")
+  ) & !bInvalidateCaches)
+{
+  shp <- readRDS(paste0(cacheFileRoot,"_lgb_shapviz.rds"))
+} else {
+  shp <- shapviz(
+    lgbm1,
+    X_pred=train.x.lgbm[shp_int_subset,],
+    X=train[shp_int_subset]
+  )
+  
+  setDT(shp$X)
+  
+  if(bUseCache)
+    saveRDS(shp,paste0(cacheFileRoot,"_lgb_shapviz.rds"))
+}
+
+## Feature importance
+sv_importance(shp) + theme_minimal()
+
+```
+
+#### Feature Interaction Table
+
+We also develop a table of interaction strengths, sorted by the total contribution to explaining variation in the data. Again, aggregation bias can distort the ranking, so interpreting the ranking should be taken with caution.
+
+```{r lgbm-int-table, message = FALSE, warning = FALSE}
+## Convert the 'imp.int' object to a data.table
+imp.int <- data.table(imp.int)
+
+## Create a new column 'Feature2' by sorting and collapsing elements of 'Feature'
+imp.int[, Feature2 := sapply(Feature, FUN = function(f) {
+  paste(sort(unlist(strsplit(f, ":"))), collapse = ":")
+})]
+
+## Aggregate 'sumGain', 'sumCover', and 'frequency' by the new 'Feature2' column
+imp.int2 <- imp.int[, .(
+  sumGain = sum(sumGain),
+  sumCover = sum(sumCover),
+  frequency = sum(frequency)
+), by = .(Feature = Feature2)]
+
+## Calculate additional metrics: meanCover, meanGain, sumGainPct, sumCoverPct
+imp.int2[, `:=`(
+  meanCover = sumCover / frequency,
+  meanGain = sumGain / frequency,
+  sumGainPct = sumGain / sum(sumGain),
+  sumCoverPct = sumCover / sum(sumCover)
+)]
+
+## Split 'Feature' into 'Feature1' and 'Feature2' columns
+imp.int2[, c("Feature1", "Feature2") := tstrsplit(Feature, ":")]
+
+## Order by 'sumGain' in descending order and create a flextable with scrollable properties
+imp.int2[order(-sumGain)] %>%
+  flextable() %>%
+  set_table_properties(opts_html = list(
+    scroll = list(
+      add_css = "max-height: 500px;"
+    )
+  ))
+```
+
+#### Gain vs. Cover
+
+As noted above, 'gain' refers to the improvement in accuracy brought by a feature to the branches it is on, thus indicating the feature is important.  'cover' measures the number of times a feature is used to split the data across all trees regardless of the gain in accuracy achieved. A high gain with a high cover suggests a feature that is very useful across many parts of the dataset.
+
+```{r lgbm-gain-v-cover, message=FALSE,warning=FALSE}
+## Create scatter plot
+ggplot(imp.int2, aes(x = sumCover, y = sumGain, label = Feature)) + 
+  geom_point() + 
+  scale_size() +  
+  ggrepel::geom_label_repel() +  # Add labels with repulsion
+  theme_minimal()  
+```
+
+### Feature Plots {.tabset}
+
+It is useful to plot SHAP values for their main effects (e.g., SHAP values for face amount band by face amount band) as well as interactions (e.g., same, but stratified in some way by other variables). Traditionally, scatter plots are used. However, due to overplotting, it is not clear what is going on with the SHAP values. Here we use boxplots of the SHAP values instead of scatter plotting. This provides a sense of the spread of the SHAP values along with the median and outliers. This is particularly useful for qualitatively evaluating whether there are any meaningful interactions.
+
+In what follows, red diamonds are mean SHAP values, while blue squares are mean mortality from a subset of the data. Note that SHAP values are partial effects which work in concern with the other features. Therefore, the mean actual mortality will not necessarily be captured by the variability of the feature SHAP values.
+
+```{r lgbm-feature-plots, results='asis', message=FALSE, warning=FALSE}
+## Load external R script
+source("R/ilec_shap_plot.R")
+
+## Select top features to plot
+featurestoplot <- imp[1:nPlotTopFeatures, Feature]
+
+## Initialize plot list
+plist <- list()
+
+## Loop through top features
+for (i in 1:nPlotTopFeatures) {
+  ## Filter interactions for current feature
+  int.vars <- imp.int2[featurestoplot[i] == Feature1 | featurestoplot[i] == Feature2] %>%
+    head(nPlotTopInteractions) %>%
+    select(Feature1, Feature2) %>%
+    pivot_longer(cols = c(Feature1, Feature2), values_to = "Feature") %>%
+    distinct() %>%
+    filter(Feature != featurestoplot[i])
+  
+  ## Add SHAP plot to list
+  plist <- c(plist, 
+             ilec_shap_plot(
+               shp,
+               featurestoplot[i],
+               int.vars$Feature,
+               resp_var = resp_var,
+               resp_offset = resp_offset,
+               train.data = train[shp_int_subset]
+             )
+  )
+}
+
+## Print plots with headers
+plist %>%
+  iwalk(~ {
+    cat('#### ', .y, '\n\n')
+    print(.x)
+    cat('\n\n')
+  })
+```
+
+Some patterns are noticeable. We discuss them for each group. You can visually detect an interaction by checking whether the box plots are all on the same level or not for a given subgroup.
+
+Underwriting (uw)
+
+1. Main effect
+    a. The spreads from highest to lowest risk classes are similar across non-smoker class systems.
+    b. Smoker differentiation is narrower than for 2-class non-smokers.
+2. Interaction with face amount band
+    a. The interaction between underwriting and face amount band, for the underwriting effect, appears confined mostly to 3-class non-smoker (N/3/*). Higher face amount bands ($250K+ in the light dataset) appear to have larger spread of effects.
+3. Interaction with issue age band: possible narrowing at older ages for 2- or 4-class non-smokers
+4. Interaction with observation year: possible widening of spread of 4-class non-smokers with increasing observation year
+
+Face Amount Band (face_amount_band)
+
+1. Main effect: expected decrease as face amount band increases
+2. Interaction with underwriting: face amount effect may be interacting with the Unknown smoker category
+3. Interaction with issue age band: 
+    a. Decreasing effect by issue age for lower bands, flipping to increasing effect by issue age for upper issue age bands
+    b. Put another way, spread of face amount effects decreases with increasing issue age
+4. Interaction with Observation Year: no obvious effect
+
+Issue Age Band (ia_band1)
+
+1. Main Effect: With the exception of ages 18-24, decreasing issue age effect by issue age
+2. Interaction with face amount band: similar to face amount band, spread decreases with increasing issue age
+3. Interaction with underwriting: substantial changes above issue age 75, qualitatively negligible below age 75
+4. Interaction with observation year: no obvious interaction
+
+### Goodness-of-Fit
+
+Goodness-of-fit tables are provided. Each table provides actual-to-model ratios for single variables and for 2-way combinations of variables. A model is qualitatively deemed to perform well if goodness-of-fit ratios are close to 100% in almost all situations. The quantitative assessment using significance testing is omitted here.
+
+#### Unvariate Goodness-of-Fit {.tabset}
+
+```{r gbm-gof-univariate, message=FALSE, warning=FALSE,results='asis'}
+## Process each factor column and create formatted tables
+map(factor_cols, .f = \(x) {
+  ## Convert column name to symbol
+  x <- sym(x)
+  
+  ## Group data by factor column and calculate summary statistics
+  train %>%
+    group_by(!!x) %>%
+    summarize(
+      Outcome = sum(amount_actual),
+      AM = sum(amount_actual) / sum(predictions_lgbm1)
+    ) %>%
+    flextable() %>%  # Create a flextable
+    set_formatter(  # Format 'AM' as a percentage
+      AM = function(x) {
+        if (is.numeric(x))
+          sprintf("%.1f%%", x * 100)
+        else
+          x
+      }
+    ) %>%
+    colformat_num(j = "Outcome") %>%  # Format 'Outcome' column
+    set_header_labels(  # Set custom header labels
+      Outcome = "Outcome",
+      AM = "Actual-to-Model"
+    ) %>%
+    autofit() #%>%
+    #knitr::knit_print()  # Print the table in a format suitable for knitting
+}) %>%   # Set names for each element in the list
+  purrr::set_names(factor_cols) ->
+  output_tables
+
+if(output_format == "html") {
+  output_tables %>%
+    map(.f=knitr::knit_print) %>%
+    generate_tabset(  # Generate tabset from the list of tables
+      tabtitle = "",
+      tablevel = 4
+    ) %>%
+    cat()  # Print the tabset
+} else {
+  export_tables_to_excel(
+    output_tables,
+    paste0(
+      exportsRoot,
+      "_lightgbm_univariate_goodness_of_fit_tables.xlsx"
+    )
+  )
+  
+  cat("See included Excel table for additional information.\n")
+  
+}
+
+```
+
+#### Bivariate Goodness-of-Fit {.tabset}
+
+```{r gbm-gof-bivariate, message=FALSE, warning=FALSE,results='asis'}
+## Create a list of unique pairs of factor columns
+pairlist <- data.table()
+for (i in 1:(length(factor_cols) - 1)) {
+  for (j in (i + 1):length(factor_cols)) {
+    pairlist <- rbind(pairlist, data.table(F1 = factor_cols[i], F2 = factor_cols[j]))
+  }
+}
+
+## Generate summary tables and formatted outputs for each pair of factor columns
+map2(.x = pairlist$F1, .y = pairlist$F2, .f = \(x, y) {
+  ## Convert column names to symbols for tidy evaluation
+  xs <- sym(x)
+  ys <- sym(y)
+  
+  ## Choose grouping order based on the number of levels in each factor
+  ## Group by the factor with more levels first for better summarization
+  if (length(train[, levels(get(x))]) >= length(train[, levels(get(y))])) {
+    fttmp <- train %>%
+      group_by(!!xs, !!ys) %>%
+      summarize(
+        Outcome = sum(amount_actual),  # Calculate the total outcome
+        Ratio = sprintf("%.1f%%", 100 * sum(amount_actual) / sum(predictions_lgbm1))  # Calculate the actual-to-model ratio
+      ) %>%
+      pivot_wider(
+        names_from = !!ys,  # Pivot the data to widen by the second factor
+        values_from = c(Outcome, Ratio),  # Use Outcome and Ratio as values
+        names_glue = paste0(y, ": {", y, "}.{.value}"),  # Create new column names using glue syntax
+        names_vary = "slowest"  # Handle varying names by the slowest changing variable
+      )
+  } else {
+    fttmp <- train %>%
+      group_by(!!ys, !!xs) %>%
+      summarize(
+        Outcome = sum(amount_actual),  # Calculate the total outcome
+        Ratio = sprintf("%.1f%%", 100 * sum(amount_actual) / sum(predictions_lgbm1))  # Calculate the actual-to-model ratio
+      ) %>%
+      pivot_wider(
+        names_from = !!xs,  # Pivot the data to widen by the first factor
+        values_from = c(Outcome, Ratio),  # Use Outcome and Ratio as values
+        names_glue = paste0(x, ": {", x, "}.{.value}"),  # Create new column names using glue syntax
+        names_vary = "slowest"  # Handle varying names by the slowest changing variable
+      )
+  }
+  
+  ## Adjust column keys for the flextable
+  ## Start with the first column name
+  fttmp.colkeys <- names(fttmp)[1]
+  ## Add pairs of Outcome and Ratio columns, inserting a blank column between each pair
+  for (i in 1:((length(names(fttmp)) - 1) / 2)) {
+    fttmp.colkeys <- c(fttmp.colkeys, paste0("blank", i), names(fttmp)[(2 * i):(2 * i + 1)])
+  }
+  
+  ## Create and print the flextable
+  fttmp %>%
+    flextable(col_keys = fttmp.colkeys) %>%
+    ftExtra::span_header(sep = "\\.") %>%
+    align(align = 'center', part = "all") %>%
+    empty_blanks() %>%
+    autofit() #%>%
+    #knitr::knit_print()
+}) %>%
+  ## Set names for each element in the list based on the factor column pairs
+  purrr::set_names(pairlist[, paste0(F1, " x ", F2)]) ->
+  output_tables
+
+if(output_format == "html") {
+  output_tables %>%
+    map(.f=knitr::knit_print) %>%
+    ## Generate a tabset from the list of formatted tables
+    generate_tabset(tabtitle = "", tablevel = 4) %>%
+    ## Print the generated tabset
+    cat()  
+} else {
+  export_tables_to_excel(
+    output_tables,
+    paste0(
+      exportsRoot,
+      "_lightgbm_bivariate_goodness_of_fit_tables.xlsx"
+    )
+  )
+  
+  cat("See included Excel table for additional information.\n")
+}
+
+```
+

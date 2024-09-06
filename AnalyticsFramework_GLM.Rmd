@@ -1,0 +1,428 @@
+## GLM
+
+Below is an analysis using a main-effects GLM to better understand the data. We integrate two modeling approaches:
+
+- Standard GLM analysis with model calibration (but no model building), including presentation of coefficients and residuals analysis, and
+- An approach to explore the interactions of the main effects model along selected dimensions of the data, checking the average main effects for those subsets, weighted according to the offset used in the analysis.
+
+### Model Summary
+
+```{r glm-model, message=FALSE, warning=FALSE}
+## Construct the model formula from predictor columns
+modelFormula <- paste(pred_cols, collapse = " + ")
+
+## Include offset in the model formula if it exists
+if (exists("resp_offset")) {
+  modelFormula <- paste(
+    modelFormula,
+    paste0("offset(log(", resp_offset, "))"),
+    sep = " + "
+  )
+}
+
+## Complete the model formula with the response variable
+modelFormula <- paste(resp_var, modelFormula, sep = " ~ ")
+modelFormula <- as.formula(modelFormula)
+
+## Check if the cached model exists and is valid
+if (bUseCache & file.exists(paste0(cacheFileRoot, "_glm_model.rds")) & !bInvalidateCaches) {
+  ## Load the cached model if it exists
+  modelGLM <- readRDS(paste0(cacheFileRoot, "_glm_model.rds"))
+} else {
+  ## Fit the GLM model using the specified formula and data
+  modelGLM <- glm(
+    formula = modelFormula, 
+    family = quasipoisson, 
+    data = train,
+    x = FALSE,
+    y = FALSE,
+    model = FALSE
+  )
+  ## Remove the data from the model object to reduce size
+  modelGLM$data <- c()
+  
+  ## Save the fitted model to cache if caching is enabled
+  if (bUseCache) {
+    saveRDS(modelGLM, paste0(cacheFileRoot, "_glm_model.rds"))
+  }
+}
+
+## Append predictions to the dataset
+ds[, predictions_glm := predict(modelGLM, newdata = .SD, type = "response")]
+train[, predictions_glm := predict(modelGLM, newdata = .SD, type = "response")]
+test[, predictions_glm := predict(modelGLM, newdata = .SD, type = "response")]
+```
+
+#### Model, Table of Coefficients, ANOVA {.tabset}
+
+##### Model Summary
+
+Below is the table of coefficients for the fitted GLM. Each entry is a coefficient in the table for the level of the indicated variable. The estimate and standard errors are on the scale of the linear predictor. For a Poisson model with log link, this means they are on the log scale.
+
+```{r glm-model-summary}
+## Show summary of the model
+modelGLM %>% 
+  as_flextable() %>%
+  set_table_properties(opts_html=list(
+    scroll=list(
+      add_css="max-height: 500px;"
+      )
+    )
+    )
+```
+
+##### ANOVA
+
+The ANOVA table displays the analysis of deviance for the GLM. For each variable, we see the proportion of deviance explained by that variable and its associated degrees of freedom. 
+
+```{r glm-model-anova}
+## Show the ANOVA table
+
+## Check if the cached ANOVA results exist and are valid
+if (bUseCache & file.exists(paste0(cacheFileRoot, "_glm_model_anova.rds")) & !bInvalidateCaches) {
+  ## Load the cached ANOVA results if they exist
+  mod.glm.anova <- readRDS(paste0(cacheFileRoot, "_glm_model_anova.rds"))
+} else {
+  ## Perform ANOVA on the GLM model
+  mod.glm.anova <- anova(modelGLM, test = "Chisq")
+  
+  ## Save the ANOVA results to cache if caching is enabled
+  if (bUseCache) {
+    saveRDS(mod.glm.anova, paste0(cacheFileRoot, "_glm_model_anova.rds"))
+  }
+}
+
+## Convert the ANOVA results to a data table, add feature names, and format the table
+mod.glm.anova %>% 
+  as.data.table() %>%  # Convert to data table
+  add_column(rownames(mod.glm.anova), .before = 1) %>%  # Add feature names as a new column
+  setnames(old = 1, new = "feature") %>%  # Rename the new column to "feature"
+  flextable() %>%  # Create a flextable for formatting
+  set_formatter(
+    `Pr(>Chi)` = function(x) ifelse(x < 0.01, "< 0.1%", sprintf("%1.2f%%", 100 * x))  # Format p-values
+  )
+```
+
+##### Lift 
+
+The lift plot compares the GLM against the underlying mortality table.
+
+```{r glm-lift-lorenz, message=FALSE, warning=FALSE}
+## generate lift plot
+test[,decile.table(get(resp_var),predictions_glm/get(resp_offset),get(resp_offset))] %>%
+  pivot_longer(-c(decile,exposures)) %>% 
+  as.data.table() %>%
+  ggplot(aes(x=decile, y=value, col=name)) +  
+  geom_line() +
+  scale_x_continuous(breaks=c(1:10)) +
+  labs(x="Decile",y="Response")+
+  ggtitle("Decile Lift Plot") +
+  theme_minimal() +
+  scale_y_continuous(labels=scales::comma)
+```
+
+##### Lorenz Plot
+
+The Lorenz plot demonstrates a model's ability to stratify predictions against a null baseline.
+
+```{r glm-lorenz, message=FALSE, warning=FALSE}
+## lorenz plot
+test[,lorenz(get(resp_var), predictions_glm / get(resp_offset), get(resp_offset))]
+```
+
+The table of coefficients shows a number of interesting phenomena and perhaps some surprises:
+
+- Gender is not significant. Since we are using an offset of tabular expected rates, the interpretation is that the underlying differentials in the tabular expected rates are adequate for the current data, after adjusting for other factors.
+- Underwriting is the most influential factor from the ANOVA perspective.
+- Both the most recent issue years (2010+) and the most recent durations show significant mortality factors. Durations 1 and 2 are significantly higher than durations 3+
+- While insurance plans other than "Other" are significantly different from 0, a quick glance at the effects plot shows that the UL/VL plans are not significantly different from each other and with Perm, while Term is borderline significantly different from UL/VL.
+- Face amount bands 250K and greater have factors not significant from one another.
+
+### Model Illustrations and Graphics
+
+#### Effects Plots {.tabset}
+
+Because the model contains every column, this is equivalent to computing the marginal actual-to-tabular ratios. However, the model also provides standard errors, which is useful for assessing the significance of the marginal ratios.
+
+```{r glm-effects-plots-amount, message=FALSE, warning=FALSE, results='asis'}
+## Plot amount model terms
+
+## Calculate the dispersion parameter for the GLM model
+glm_disp <- sum(modelGLM$residuals^2 * modelGLM$weights) / modelGLM$df.residual
+
+## Generate plots for each predictor column
+lapply(pred_cols, function(s) {
+  ## Summarize the data for the current predictor
+  p <- ds[, .(
+      predicted = sum(predictions_glm) / sum(amount_2015vbt),
+      stde = sqrt(sum(predictions_glm) * glm_disp) / sum(amount_2015vbt)
+    ), by = c(s)] %>%
+    setnames(s, "x") %>%  # Rename the grouping column to "x"
+    mutate(
+      x = fct_relevel(
+        x,
+        sort(levels(x))  # Reorder factor levels
+      )
+    ) %>%
+    as.data.table() %>%
+    ## Create the plot
+    ggplot(aes(x = x, y = predicted)) +
+    geom_point() +  # Add points for the predicted values
+    geom_errorbar(
+      aes(
+        ymin = predicted - 1.96 * stde,
+        ymax = predicted + 1.96 * stde
+      )  # Add error bars for the 95% confidence interval
+    ) +
+    geom_hline(yintercept = 1, linetype = 2) +  # Add a horizontal line at y = 1
+    scale_y_continuous(
+      name = "Factor",
+      labels = scales::percent  # Format y-axis labels as percentages
+    ) +
+    scale_x_discrete(name = s) +  # Set x-axis name to the current predictor
+    theme_minimal() +  # Use a minimal theme for the plot
+    theme(
+      axis.text.x = element_text(angle = 45)  # Rotate x-axis text for readability
+    )
+  
+  return(p)  # Return the plot
+}) %>%
+  purrr::set_names(pred_cols) %>%  # Set names for each plot based on predictor columns
+  iwalk(~ {
+    cat('##### ', .y, '\n\n')  # Print the plot title
+    print(.x)  # Print the plot
+    cat('\n\n')  # Add spacing after each plot
+  })
+```
+
+
+
+#### Goodness-of-Fit
+
+Goodness-of-fit tables are provided. Each table provides actual-to-model ratios for single variables and for 2-way combinations of variables. A model is qualitatively deemed to perform well if goodness-of-fit ratios are close to 100% in almost all situations. The quantitative assessment using significance testing is omitted here.
+
+##### Unvariate Goodness-of-Fit {.tabset}
+
+```{r glm-gof-univariate, message=FALSE, warning=FALSE,results='asis'}
+## Generate summary tables for each factor column and format them
+map(factor_cols, .f = \(x) {
+  ## Convert column name to symbol for tidy evaluation
+  x <- sym(x)
+  resp_var_sym <- resp_var
+  
+  ## Summarize data by the current factor column
+  train %>%
+    group_by(!!x) %>%
+    summarize(
+      Outcome = sum(amount_actual),  # Sum the actual amounts
+      AM = sum(amount_actual) / sum(predictions_glm)  # Calculate the Actual-to-Model ratio
+    ) %>%
+    ## Create a flextable for the summarized data
+    flextable() %>%
+    ## Format the Actual-to-Model column as percentages
+    set_formatter(
+      AM = function(x) {
+        if (is.numeric(x))
+          sprintf("%.1f%%", x * 100)
+        else
+          x
+      }
+    ) %>%
+    ## Format the Outcome column as numbers
+    colformat_num(j = "Outcome") %>%
+    ## Set header labels for the table
+    set_header_labels(
+      Outcome = "Outcome",
+      AM = "Actual-to-Model"
+    ) %>%
+    autofit() # %>%
+    ## Print the flextable
+    #knitr::knit_print()
+}) %>%
+  ## Set names for each table based on the factor columns
+  purrr::set_names(factor_cols) -> 
+  output_tables
+
+if(output_format == "html") {
+  output_tables %>%
+    ## Print the flextable
+    map(.f=knitr::knit_print) %>%
+    ## Generate a tabset from the list of tables
+    generate_tabset(
+      tabtitle = "",
+      tablevel = 5
+    ) %>%
+    ## Print the generated tabset
+    cat()  
+} else {
+  export_tables_to_excel(
+    output_tables,
+    paste0(
+        exportsRoot,
+        "_glm_univariate_goodness_of_fit_tables.xlsx"
+      )
+  )
+  
+  cat("See included Excel table for additional information.\n")
+}
+
+```
+
+##### Bivariate Goodness-of-Fit {.tabset}
+
+```{r glm-gof-bivariate, message=FALSE, warning=FALSE,results='asis'}
+## Generate a list of unique pairs of factor columns
+pairlist <- data.table()
+for (i in 1:(length(factor_cols) - 1)) {
+  for (j in (i + 1):length(factor_cols)) {
+    ## Initialize or append to the pairlist
+    if (i == 1 & j == 2) {
+      pairlist <- data.table(F1 = factor_cols[i], F2 = factor_cols[j])
+    } else {
+      pairlist <- rbind(pairlist, data.table(F1 = factor_cols[i], F2 = factor_cols[j]))
+    }
+  }
+}
+
+## Generate and format summary tables for each pair of factor columns
+map2(.x = pairlist$F1, .y = pairlist$F2, .f = \(x, y) {
+  xs <- sym(x)
+  ys <- sym(y)
+  
+  ## Choose grouping order based on the number of levels in each factor
+  if (length(train[, levels(get(x))]) >= length(train[, levels(get(y))])) {
+    fttmp <- train %>%
+      group_by(!!xs, !!ys) %>%
+      summarize(
+        Outcome = sum(amount_actual),
+        Ratio = sprintf("%.1f%%", 100 * sum(amount_actual) / sum(predictions_glm))
+      ) %>%
+      pivot_wider(
+        names_from = !!ys,
+        values_from = c(Outcome, Ratio),
+        names_glue = paste0(y, ": {", y, "}.{.value}"),
+        names_vary = "slowest"
+      )
+  } else {
+    fttmp <- train %>%
+      group_by(!!ys, !!xs) %>%
+      summarize(
+        Outcome = sum(amount_actual),
+        Ratio = sprintf("%.1f%%", 100 * sum(amount_actual) / sum(predictions_glm))
+      ) %>%
+      pivot_wider(
+        names_from = !!xs,
+        values_from = c(Outcome, Ratio),
+        names_glue = paste0(x, ": {", x, "}.{.value}"),
+        names_vary = "slowest"
+      )
+  }
+  
+  ## Adjust column keys for the flextable
+  fttmp.colkeys <- names(fttmp)[1]
+  for (i in 1:((length(names(fttmp)) - 1) / 2)) {
+    fttmp.colkeys <- c(fttmp.colkeys, paste0("blank", i), names(fttmp)[(2 * i):(2 * i + 1)])
+  }
+  
+  ## Create and print the flextable
+  fttmp %>%
+    flextable(col_keys = fttmp.colkeys) %>%
+    ftExtra::span_header(sep = "\\.") %>%
+    align(align = 'center', part = "all") %>%
+    empty_blanks() %>%
+    autofit() #%>%
+    #knitr::knit_print()
+}) %>%
+  ## Set names for each element in the list based on the factor column pairs
+  purrr::set_names(pairlist[, paste0(F1, " x ", F2)]) ->
+  output_tables
+
+if(output_format == "html") {
+  output_tables %>%
+    map(.f=knitr::knit_print) %>%
+    ## Generate a tabset from the list of formatted tables
+    generate_tabset(tabtitle = "", tablevel = 5) %>%
+    ## Print the generated tabset
+    cat()
+} else {
+  export_tables_to_excel(
+    output_tables,
+    paste0(
+        exportsRoot,
+        "_glm_bivariate_goodness_of_fit_tables.xlsx"
+      )
+  )
+  
+  cat("See included Excel table for additional information.\n")
+}
+
+```
+
+#### Subgroup Variability {.tabset}
+
+This section reproduces Brian Holland's publication. For background on the tables generated below, please refer to the publication.
+
+```{r glm-bh-tables, message = FALSE, warning = FALSE, results='asis'}
+## Load custom functions
+source("R/functions_BDHGLM.R")
+
+## Generate and format summary tables for each factor column
+factor_cols %>%
+  map(.f = \(x) {
+    ## Call the mainF function to compute weighted averages for GLM factors
+    mainF(
+      df = ds,
+      model = modelGLM,
+      rf = x,
+      resp = resp_var,
+      offset = resp_offset
+    ) %>%
+      ## Create a flextable from the results
+      flextable() %>%
+      ## Set header labels for the table
+      set_header_labels("rowname" = "") %>%
+      ## Format table values as percentages if numeric
+      set_formatter(values = function(x) {
+        if (is.numeric(x))
+          sprintf("%.1f%%", x * 100)
+        else
+          x
+      }) %>%
+      ## Set a caption for the table
+      set_caption(caption = paste0("Weighted Average GLM Factors for Variable: ", x)) %>%
+      ## Set table properties to enable scrolling
+      set_table_properties(opts_html = list(
+        scroll = list(
+          add_css = "max-height: 500px;"
+        )
+      )) %>%
+      autofit() #%>%
+      ## Print the flextable
+      #knitr::knit_print()
+  }) %>%
+  ## Set names for each table based on the factor columns
+  purrr::set_names(factor_cols) ->
+  output_tables 
+
+if(output_format == "html") {
+  output_tables %>%
+    map(.f=knitr::knit_print) %>%
+    ## Generate a tabset from the list of tables
+    generate_tabset(
+      tabtitle = "Tables of Terms",
+      tablevel = 4
+    ) %>%
+    ## Print the generated tabset
+    cat()
+} else {
+  export_tables_to_excel(
+    output_tables,
+    paste0(
+        exportsRoot,
+        "_glm_subgroup_variability.xlsx"
+      )
+  )
+  cat("See included Excel table for additional information.\n")
+}
+
+```

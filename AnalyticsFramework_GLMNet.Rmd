@@ -1,0 +1,212 @@
+## Elastic Net GLM
+
+### Background
+
+Elastic net regularization allows the modeler to combine both LASSO and ridge penalties into a single model. 
+
+As one may recall, ordinary least squares regression requires minimizing the squared difference of the response variable and the predicted values. In symbols,
+
+$$ \underset{\beta}{\arg\min} \sum_{n}(y-X\beta)^{2} $$
+
+This is equivalent to maximum likelihood estimation, where one assumes that the response variable $y$ is normally distributed with mean $X\beta$ and variance $\sigma^{2}I_{k x k}$. The maximum is taken with respect to $\beta$, and the variance parameter is assumed to be fixed but unknown.
+
+The LASSO and ridge regression methods each add an additional penalty term on the coefficients $\beta$. The LASSO adds the sum of the absolute values of the parameters $\beta$ subject to a tunable weight, $\lambda$. 
+
+$$ \underset{\beta}{\arg\min} \sum_{n}(y-X\beta)^{2}+ \lambda\sum_{k}|\beta_{k}|$$
+
+The ridge penalty adds the sum of the squares of the parameters $\beta$, subject to a tunable weight, $\alpha$.
+
+$$ \underset{\beta}{\arg\min} \sum_{n}(y-X\beta)^{2}+ \alpha\sum_{k}\beta_{k}^{2}$$
+
+What may be new to some is that in both cases, for special $\lambda$ or $\alpha$, the minimizers of these expressions correspond to the Bayesian maximum a posteriori (MAP) estimators for specific prior distributions for $\beta$. In the ridge case, the prior is the normal distribution with mean 0 and covariance $\tau^{2} I_{k x k}$ for some assumed $\tau^{2}$. 
+
+For the LASSO, the prior is the double-exponential or Laplace distribution with mean 0 and parameter $\tau$.
+
+In either case, it can be shown that if $\sigma^{2}$ and $\tau$ are known, the penalizing weights have unique solutions. In practice, the penalizing weights must be tuned. the resulting optimal $\beta$ is also credible from a Bayesian perspective. Moreover, it can be shown that these facts carry over to the GLM case.
+
+### Data Preparation
+
+Elastic net GLMs as implemented in the glmnet package require that the inputs be converted to model matrices.
+
+```{r glmnet-data-prep, echo = FALSE}
+## Prepare data in matrices appropriately formatted for glmnet
+
+## Define the formula for glmnet based on the interaction depth
+if (nInteractionDepth > 1) {
+  glmnetFormula <- as.formula(paste("~ -1 + (.)^", nInteractionDepth, sep = ""))
+} else {
+  glmnetFormula <- as.formula("~ -1 + .")
+}
+
+## Create model matrices for training data
+train.x.net <- model.matrix(glmnetFormula, train[, ..pred_cols])
+train.y.net <- as.matrix(train[, ..resp_var])
+train.offset.net <- as.matrix(train[, ..resp_offset])
+
+## Create model matrices for test data
+test.x.net <- model.matrix(glmnetFormula, test[, ..pred_cols])
+test.y.net <- as.matrix(test[, ..resp_var])
+test.offset.net <- as.matrix(test[, ..resp_offset])
+```
+
+### Model Fitting
+
+Once the data are set up, we can calibrate a LASSO penalty, lambda, with n-fold cross-validation.
+
+```{r glmnet-cv}
+## In this section we fit a penalized linear regression model using glmnet. 
+## We first fine-tune hyperparameter alpha using cross-validation
+## Then we refit the model using the optimal alpha
+
+#-----------------------------------------#
+##### Perform Cross-Validation #####
+#-----------------------------------------#
+## Check if cached model exists and if caching is enabled
+if (bUseCache & file.exists("glmnet.cv.model.rds")) {
+  cvfit <- readRDS("glmnet.cv.model.rds")
+} else {
+  ## Initialize a cluster for parallel processing
+  cl <- makeCluster(nGLMNetCores)
+  registerDoParallel(cl)
+  
+  ## Set glmnet control options, enable iteration trace if debugging
+  glmnet.control(itrace = ifelse(bDebug, 1, 0))
+  
+  ## Perform cross-validated glmnet model fitting
+  cvfit <- cv.glmnet(
+    train.x.net, train.y.net, 
+    offset = log(train.offset.net),  # Log-transform the offset
+    family = "poisson",  # Specify the model family
+    alpha  = fGLMNetAlpha,  # Set the alpha parameter
+    parallel = TRUE  # Enable parallel processing
+  )
+  
+  ## Stop the parallel cluster
+  stopCluster(cl)
+  
+  ## Save the model to cache if caching is enabled
+  if (bUseCache) {
+    saveRDS(cvfit, "glmnet.cv.model.rds")
+  }
+}
+```
+
+```{r glmnet-fit}
+## Plot lambda vs deviance
+## Create a data table with lambda, cvm, cvlo, cvup, and nzero
+data.table(lambda = cvfit$lambda,
+           cvm = cvfit$cvm,
+           cvlo = cvfit$cvlo,
+           cvup = cvfit$cvup,
+           nzero = cvfit$nzero) %>%
+  ggplot(aes(x = log(lambda))) +
+  geom_point(aes(y = cvm), color = "red") +  # Plot points for cvm
+  geom_errorbar(aes(ymin = cvlo, ymax = cvup), color = "grey") +  # Add error bars
+  scale_y_continuous(name = cvfit$name, limits = range(cvfit$cvup, cvfit$cvlo)) +  # Set y-axis
+  scale_x_continuous(name = expression(Log(lambda))) +  # Set x-axis
+  geom_vline(xintercept = log(cvfit$lambda.min), linetype = 3) +  # Add vertical line for lambda.min
+  geom_vline(xintercept = log(cvfit$lambda.1se), linetype = 3)  # Add vertical line for lambda.1se
+
+## Coefficients at optimal lambda
+coef(cvfit, s = "lambda.min")
+
+#-----------------------------------------#
+##### Fit model and make predictions #####
+#-----------------------------------------#
+
+## Fit the model with optimal parameters on the full training dataset
+if (bUseCache & file.exists("glmnet.model.rds")) {
+  ## Load the cached model if it exists
+  fit.glmnet <- readRDS("glmnet.model.rds")
+} else {
+  ## Fit the glmnet model
+  fit.glmnet <- glmnet(
+    train.x.net, train.y.net, 
+    offset = log(train.offset.net), 
+    family = "poisson", 
+    lambda = ifelse(bDebug, .001, cvfit$lambda.min)
+  )
+  
+  ## Save the model to cache if caching is enabled
+  if (bUseCache) {
+    saveRDS(fit.glmnet, "glmnet.model.rds")
+  }
+}
+
+## Get coefficients for the fitted model
+coef(fit.glmnet)
+
+## Generate predictions (handling offsets correctly)
+## For test data
+test[, predictions_glmnet := predict(
+  fit.glmnet,
+  test.x.net, 
+  type = "response", 
+  newoffset = log(test.offset.net)
+)]
+
+## For train data
+train[, predictions_glmnet := predict(
+  fit.glmnet,
+  train.x.net, 
+  type = "response", 
+  newoffset = log(train.offset.net)
+)]
+```
+```{r}
+## Combine training and test datasets for plotting
+dat.glmnet.plot <- rbind(train, test)
+
+## Define the variable for observation year
+s <- "observation_year"
+s.sym <- as.symbol(s)
+
+## Summarize data by observation year and plot
+dat.glmnet.plot[,
+                .(amount_actual = sum(amount_actual),
+                  amount_2015vbt = sum(amount_2015vbt),
+                  predictions_glmnet = sum(predictions_glmnet)),
+                keyby = c(s)] %>%
+  ggplot(aes(x = {{s.sym}}, y = predictions_glmnet / amount_2015vbt)) +
+  geom_point() +  # Add points for the predictions to amount ratio
+  geom_hline(yintercept = 1, linetype = 2) +  # Add a horizontal line at y = 1
+  scale_y_continuous(
+    name = "Factor",
+    labels = scales::percent,  # Format y-axis labels as percentages
+    limits = c(0, NA)  # Set y-axis limits, starting from 0
+  ) +
+  scale_x_discrete(name = s) +  # Set x-axis name
+  theme_minimal() +  # Use a minimal theme
+  theme(axis.text.x = element_text(angle = 45))  # Rotate x-axis text for readability
+```
+
+### Model Illustrations and Graphics
+
+#### Lift and Lorenz Plots
+
+```{r glmnet-metrics}
+
+#-----------------------------------------#
+##### Calculate Validation Metrics #####
+#-----------------------------------------#
+
+## generate validation metrics
+glmnet_metrics <- test[,val(get(resp_var),predictions_glmnet,get(resp_offset))]
+
+## generate plot
+test[,decile.table(get(resp_var), predictions_glmnet/get(resp_offset), get(resp_offset))] %>%
+  pivot_longer(-c(decile,exposures)) %>%
+  as.data.table() %>%
+  ggplot(aes(x=decile, y=value, col=name)) +  
+  geom_line() +
+  scale_x_continuous(breaks=c(1:10)) +
+  labs(x="Decile",y="Deaths") +
+  ggtitle("Decile Lift Plot") 
+
+## lorenz plot
+test[,lorenz(get(resp_var), predictions_glmnet / get(resp_offset), get(resp_offset))]
+```
+
+### Summary
+
+TBD

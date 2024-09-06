@@ -1,0 +1,1051 @@
+---
+title: "Toward a Predictive Analytics Framework"
+author: "P. Adams, C. Edwalds, B. Holland, E. Hui, M. Niemerg, H. Yu"
+date: "July 10, 2024"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    code_folding: hide
+    self_contained: true
+  pdf_document:
+    toc: true
+    toc_depth: '4'
+  word_document:
+    toc: true
+    toc_depth: '4'
+bibliography: references.bib
+nocite: '@*'
+---
+
+# Executive Summary
+
+Predictive modeling is a powerful tool that leverages statistical techniques to forecast outcomes. It is widely used across various industries, from healthcare to finance, to make informed decisions based on historical data. This tutorial aims to introduce a framework for developing predictive models in the context of actuarial experience studies. To ground this framework within the context of real actuarial problems, we will also specifically look to understand and model the differences in mortality by product (whole life, term, etc.)  With the modeling approach we can see that
+
+* The relative spread of preferred mortality differs by product. 
+  + For 2-class preferred systems, the residual standard mortality is much higher than preferred for term than for other products.
+  + The spread for UL/VL/ULSG/VLSG for 4-class preferred systems is much wider than for other products.
+* There are divergences in the spread of face amount factors for xl, Perm, and Term, with xL narrowing relative to Term.
+* The issue age slope appears to be steeper for Term than Perm and xL under age 65. However, differences emerge above issue age 65, with the slope for Perm steepening relative to xL.
+* There are differences among the products in durations 1 and 2.
+* Since issues years 1990-1999, there has been a small but steady increase in relative mortality for xL vs Term, with xL now approaching Term.
+
+# Data
+
+For what follows, we used a filtered and summarized subset of the Society of Actuaries' Individual Life Experience Committee mortality data. Columns included in the extract were
+
+* Number of Preferred Classes
+* Preferred Class
+* Smoker Status
+* Face Amount Band
+* Observation_Year
+* Duration
+* Issue Age
+* Insurance Plan
+* Anticipated Level Term Period
+* Issue Year
+* Sex
+* Death Count
+* Death Claim Amount
+* Tabular Expected Mortality by Count - 2015VBT
+* Tabular Expected Mortality by Amount - 2015VBT
+
+The data were filtered as
+
+* Issue ages 18 and greater
+* Durations 25 and less
+* Experience years 2013-2017
+
+and then grouped or combined as
+
+* Underwriting: concatenation of smoker status, number of preferred classes, and preferred class, in that order
+* Duration: 1, 2, 3, 4-5, 6-15, 16-25
+* Issue Age: 18-24, 25-34, 35-44, 45-54, 55-64, 65-74, 75-84, 85-99
+* Issue Years: 1900-1989, 1990-1999, 2000-2009, 2010+
+* Insurance Plan: UL, ULSG, VL, VLSG collapsed into category "xL"
+* Face Amount Band: face amounts under 50,000 grouped into a single category, face amounts 1 million and greater grouped into a single category
+
+The intent of this heavy grouping and summarization was to enable running this document with modest computing resources. The source data can be replaced with a similarly constructed dataset with finer grouped variables.
+
+The code to generate these files can be found in the datafiles subfolder. It relies on an unpublished version of the ILEC dataset which has been restructured using the Arrow framework into a collection of Parquet files. A knowledgeable reader should be able to adapt the code to whatever environment in which they keep their own copy of the ILEC dataset.
+
+# Machine Learning in Mortality Studies 
+
+Experience studies are a primary tool that actuaries use to quantify and understand historical experience. It is a natural next step to apply statistical techniques to experience studies to discover new and relevant insights. There are multiple advantages to this approach:  
+
+* Allows the actuary to avoid cumbersome and potentially misleading univariate analysis 
+* Allows the actuary to appropriately consider credibility and unlock all the credibility inherent in the data   
+* Makes it easier to discover and appropriately adjust for variable interactions  
+* Enables the actuary the ability to statistically control for the different sources of variation in any given cell of a mortality study.  
+
+## Problem Statement 
+
+One question of interest to actuaries is why different products exhibit different mortality outcomes.  Even though they can be difficult to separately identify and quantify, it is known that underwriting, target market, policyholder behavior, and socioeconomic factors, among others, have direct bearing on mortality outcomes. With a statistical or machine learning model we have a possible solution to account for the impact of these variables. For this project, the key question we are trying to answer is how mortality varies by product in the Individual Life Experience Committee dataset.  In the simplified dataset that is used herein, the product categories are Term, Perm, UL/VL, and Other. To understand the differences in mortality by product, we will construct machine learning models to predict the mortality outcomes and analyze the results for relevant insights.  
+
+## Methodology 
+
+The framework will guide the process of code setup, model creation, preprocessing, and validation. It will also address common challenges often encountered such as: incorporating nonlinear relationships, determining interactions, dealing with underfitting and overfitting (bias-variance trade-off), and model interpretability. The goal of this project is to provide useful techniques, code, and ideas, to actuaries to guide future analysis of mortality studies.
+
+There are several common key steps in any modeling process: data preprocessing, data exploration, model selection, model validation, and model interpretation. Much more can be written on these topics than we have the space to explore, and we aim to address the key considerations as they pertain to experience studies. 
+
+## Modeling Approaches
+
+When applying statistics and machine learning to experience studies, there are multiple different modeling approaches one might take. We will focus our attention on the most common approaches used: generalized linear models (GLMs), generalized linear models with penalization (also known as elastic net GLMs), and gradient boosting machines (GBMs or GBDTs). Many other approaches or variations on these approaches are also reasonable.
+
+### Generalized Linear Models (GLM)
+
+Generalized linear models have the most history of the methods that we will examine and in some sense are the simplest. One of the benefits of GLMs is that they allow statistical hypothesis testing. For instance, individual model coefficients can be statistically tested, and various statistical tests can be performed to validate results and compare models. The results of GLMs are also relatively simple to interpret. However, GLMs have a few disadvantages: due to their relative simplicity, they have lower predictive power than other methods. To get the best performance out of a GLM, additional effort is needed to capture nonlinear relationships and interactions. Ultimately, this can make them more time-intensive than other methodologies.  
+
+GLMs can be extended into regularized GLMs, such as LASSO or Ridge, which modifies the objective used to fit the model. This regularization term offers several advantages, disadvantages, and changes to the modeling process. First, the addition of penalization makes confidence intervals and hypothesis testing infeasible. Instead of using hypothesis testing on coefficients and likelihood ratio tests to evaluate relative fitness of models, we apply a machine learning paradigm by optimizing our model using cross-validation.   Fortunately, a regularized GLM still maintains the nice interpretability of a linear model, and it can increase the overall predictive accuracy of the model. Additionally, by using a LASSO penalty, it can perform automatic feature selection.  
+
+### Gradient-Boosted Decision Trees (GBDT)
+
+Gradient boosted decision trees are an ensemble of decision trees generated in a stage-wise fashion. Each decision tree is recursively trained on the residuals of the previous tree. The first tree is a decision tree on the outcome, the second the residuals on that, and so on. In this way, the model is continually refocusing on where its predictions are weakest. Popular frameworks for gradient boosted decision trees include LightGBM, CatBoost, and XGBoost. This model is one of the most effective methods for classification and regression for tabular data.  
+
+Gradient boosting machines (applied here with LightGBM) have become the go-to approach in many tabular machine learning tasks due to their very high accuracy, ease of use, and ability to seamlessly discover important interactions.  However, they can also be the most complex to interpret. To aid in interpretation, we will discuss the use of SHAP values, which is a popular method of interpretation.  
+
+## Model Explanation
+
+### Ordered Lorenz Plot and Gini 
+
+An ordered Lorenz curve and the associated Gini coefficient measure the ability of a model to stratify risk. An ordered Lorenz curve is created using the model prediction as an index.  Using this index, we graph the cumulative percentage of claims vs the cumulative percentage of exposure. The more bowed this line, the better the model is able to predict the outcome. The Gini Index measures the difference between this line and perfect equality.  The more your model is able to predict risk, the more unequal the distribution of claims is between the model prediction, and thus the larger the Gini coefficient.  
+
+### Lift Plot 
+
+There are several different varieties of lift plots used in connection with machine learning. These plots are used to help visually understand the risk stratification and accuracy of a model. As presented here, lift plots sort the model predictions into deciles based upon the predicted value. For each decile, the model’s average prediction for that cell is graphed vs the value seen empirically in the data. The more these two values are in agreement, the better the model is performing.  
+
+### SHAP 
+
+SHAP values are a method of model interpretation in machine learning and originally come from Shapley values in economics. SHAP values measure the impact each feature has on the prediction for a particular instance. This numeric score indicates how much each feature contributed to the prediction in terms of sign and magnitude.
+
+### Feature Importance 
+
+Feature importance is a global measure of how much a variable contributes to the predictions of a target variable within a model. This can be helpful in interpreting a model to understand the key drivers in aggregate. However, unlike SHAP values, feature importance does not help you interpret individual predictions. Feature importance is usually presented in terms of percent contribution. When done so, a feature importance of 20% for a feature would implies that 20% of the overall reduction in prediction error is attributable to that particular feature. There are multiple ways of measuring feature importance. One of the simplest and most intuitive is permutation feature importance. Using this method, you scramble a particular feature so that it is no longer useful and measure the percent difference in model performance before and after this change. The change in error would be the importance.
+
+The reader should be cautioned that a low relative importance does not imply lack of significance or of predictive value. For example, gender is a well-known predictor of mortality. The variation explainable by other factors of the data can greatly exceed the variation arising from gender, and interactions with other variables like age can further rob gender of importance attributed to it. The effect then is to push gender down the feature importance list.
+
+### Goodness-of-Fit
+
+No matter how well a model may behave on measures of feature importance, lift, Lorenz and Gini indices, mean square error, deviance, and so on, it is nonetheless important to check goodness-of-fit. Goodness-of-fit checks allow us to see how well a model reproduces the phenomena of interest. For our purposes, this is the same as checking ratios of actual claims to model predicted claims. In each model section, there are univariate and bivariate goodness-of-fit tables. Ideally, we should see 100% for all entries. For the GLM model and the univariate goodness-of-fit checks, we will see this throughout the tables of goodness-of-fit, as a non-penalized GLM will reproduce the margins for any included categorical variable or interaction of categorical variables. For space reasons, we omit a test for ratios significantly different from 100%. However, qualitatively, ratios far from 100%, perhaps +/- 5% or +/- 10%, should be deemed as evidence of poor fit for that cell.
+
+# Framework Preparation
+
+Before getting to the core data analysis task, we need to first prepare the R environment by configuring display and model options, loading necessary libraries. Then, we load the data and prep for running data analysis and modeling. This section also reads in the dataset and splits the data into training and testing sets based on the observation year. Additionally, most parameters are set here. If prototyping is enabled, it creates a smaller subset of the training data for quicker processing.
+
+```{r setup, include=FALSE, warning=FALSE,message=FALSE}
+knitr::opts_chunk$set(echo = TRUE
+                      #,eval=FALSE
+                      #,include=FALSE
+                      )
+```
+Here, we set display options. 
+```{r setup_useroptions, warning=FALSE, message=FALSE}
+#-----------------------------------------#
+##### Display Options #####
+#-----------------------------------------#
+## turn off scientific notation
+options(scipen = 999)
+
+## change how many digits to display
+options(digits=4)
+
+## Suppress warnings
+options(warn = -1)
+
+## Determine which output we are generating
+## This will be html, docx, or pdf
+if(interactive()) {
+  output_format <- "html"
+} else {
+  output_format <- knitr::opts_knit$get("rmarkdown.pandoc.to")  
+}
+```
+
+Here we set model options for GLMNET and LightGBM.
+```{r setup_modelroptions, warning=FALSE, message=FALSE}
+#-----------------------------------------#
+##### Model Options #####
+#-----------------------------------------#
+
+## When TRUE, only a fraction of the data is used, drastically reducing runtimes
+prototype      <- FALSE
+prototype_size <- 50000  ## number of records in data fraction
+nTrainSeed     <- 42     ## seed to use when splitting the data for reproducibility
+
+## GLMNet parameters
+nGLMNetCores                <- 10
+nInteractionDepth           <- 1
+fGLMNetAlpha                <- 0.5
+nUseTopLightGBMInteractions <- "ALL" # Integer or "ALL"
+bUseSparse                  <- TRUE
+nELSeed                     <- 13579
+
+## LightGBM parameters 
+flgbm_vis_subset     <- 0.1
+bFullInteractions    <- FALSE  # Very slow in default configuration
+nPlotTopFeatures     <- 3
+nPlotTopInteractions <- 3
+nGBMSeed             <- 1337
+
+## Flags for running specific models
+runGLM      <- TRUE
+runLightGBM <- TRUE
+runGLMInt   <- TRUE
+```
+
+Here we load all required libraries. 
+
+```{r setup2, warning=FALSE,message=FALSE}
+#-----------------------------------------#
+##### Required libraries #####
+#-----------------------------------------#
+## Less verbose tidyverse
+options (tidyverse.quiet = TRUE)
+
+## We use bUseGroundhog in the R codespaces to control versioning,
+## If you have your own setup, set to FALSE.
+## Things may nonetheless break, so use at your own risk.
+bUseGroundhog <- FALSE  
+
+if(bUseGroundhog) {
+  pkgDate <- "2024-05-09"
+  
+  suppressPackageStartupMessages( {
+      library(groundhog)
+      
+      groundhog.library(pre,pkgDate)
+      groundhog.library(lightgbm,pkgDate)
+      groundhog.library(data.table,pkgDate)  
+      groundhog.library(lmtest,pkgDate)
+      groundhog.library(glmnet,pkgDate)
+      groundhog.library(dplyr,pkgDate)
+      groundhog.library(EIX,pkgDate)
+      groundhog.library(ggplot2,pkgDate)
+      groundhog.library(tidyr,pkgDate)
+      groundhog.library(doParallel,pkgDate)
+      groundhog.library(tidyverse,pkgDate)
+      groundhog.library(magrittr,pkgDate)
+      groundhog.library(dtplyr,pkgDate)
+      groundhog.library(flextable,pkgDate)
+      groundhog.library(ftExtra,pkgDate)
+      groundhog.library(arrow,pkgDate)
+      groundhog.library(here,pkgDate)
+      groundhog.library(shapviz,pkgDate)
+      groundhog.library(patchwork,pkgDate)
+      groundhog.library(Matrix,pkgDate)
+      groundhog.library(MatrixModels,pkgDate)
+      groundhog.library(openxlsx,pkgDate)
+      groundhog.library(flexlsx,pkgDate)
+    }
+  )
+
+} else {
+  suppressPackageStartupMessages({
+    library(pre)
+    library(lightgbm)
+    library(data.table)  
+    library(lmtest)
+    library(glmnet)
+    library(dplyr)
+    library(EIX)
+    library(ggplot2)
+    library(tidyr)
+    library(doParallel)
+    library(tidyverse)
+    library(magrittr)
+    library(dtplyr)
+    library(flextable)
+    library(ftExtra)
+    library(arrow)
+    library(here)
+    library(shapviz)
+    library(patchwork)
+    library(Matrix)
+    library(MatrixModels)
+    library(openxlsx2)
+    library(flexlsx)
+  })
+}
+
+#-----------------------------------------#
+##### Set Folder Locations #####
+#-----------------------------------------#
+
+source("R/functions.R")
+source("R/glmnet_support.R")
+
+## set library location
+local_libraries <- FALSE
+if(local_libraries)
+{
+  library.dir <- 'D:\\Data\\Niemerg\\Life Predictive Mortality POG\\01 library'
+  .libPaths(new = library.dir)
+}
+
+bDebug <- FALSE
+
+## Save the expensive working objects and reload if they exist. If this is true  
+## and they do not exist, the computations will rerun.
+bUseCache <- TRUE
+bInvalidateCaches <- FALSE
+
+#-----------------------------------------#
+##### Data Options #####
+#-----------------------------------------#
+
+src_file <- 'http://finriskanalytics-ilecdata.s3-website-us-east-1.amazonaws.com/ilec13_17_framework_light.parquet'
+
+cacheFileRoot <- file.path(
+  getwd(),
+  "objectcache",
+  tools::file_path_sans_ext(
+    tail(
+      unlist(strsplit(src_file,"/")),
+      1
+    )
+  )
+)
+
+exportsRoot <- file.path(
+  getwd(),
+  "render_exports",
+  tools::file_path_sans_ext(
+    tail(
+      unlist(strsplit(src_file,"/")),
+      1
+    )
+  )
+)
+
+#-----------------------------------------#
+##### Modeling Parameters #####
+#-----------------------------------------#
+resp_var    <- "amount_actual"
+resp_offset <- "amount_2015vbt"
+
+pred_cols <- c("uw",
+               "face_amount_band",
+               "dur_band1",
+               "ia_band1",
+               "gender",
+               "insurance_plan",
+               "ltp",
+               "iy_band1")
+
+factor_cols <- c("uw",
+               "face_amount_band",
+               "dur_band1",
+               "ia_band1",
+               "gender",
+               "insurance_plan",
+               "ltp",
+               "iy_band1")
+
+
+```
+
+Here we read the data, convert specified columns to categorical factors to ensure proper data handling and adjust the labels for the 'face_amount_band' factor to avoid issues in model outputs. The dataset is split into training and testing sets based on the observation year, with the year 2017 data used for validation. If prototyping is enabled, the code further subsets the training data to a smaller size for faster processing, ensuring reproducibility by setting a seed before shuffling and selecting the subset.
+
+```{r data-prep}
+
+#-----------------------------------------#
+##### Load dataset #####
+#-----------------------------------------#
+
+## Determine the file extension of the source file
+file_type <- tools::file_ext(src_file)
+
+## Read the dataset based on file extension
+if (file_type == "csv") {
+  ## Load a CSV file
+  ds <- fread(src_file)
+} else if (file_type == "parquet") {
+  ## Load a Parquet file and convert it to a data table
+  if(src_file %like% "amazonaws.com") {
+    s3b <- s3_bucket(strsplit(urltools::domain(src_file),".",fixed=T)[[1]][1])
+    ds <- read_parquet(s3b$path(urltools::path(src_file)))
+  } else {
+    ds <- arrow::read_parquet(src_file) %>% as.data.table()
+  }
+}
+
+#-----------------------------------------#
+##### Convert columns to factors #####
+#-----------------------------------------#
+
+## This step ensures that categorical data is appropriately treated as such.
+ds[, (factor_cols) := lapply(.SD, factor), .SDcols = factor_cols]
+
+## Adjust the labels for the 'face_amount_band' factor
+## Replace colons in factor names with hyphens to avoid issues in model outputs
+ds[, face_amount_band := fct_relabel(
+  face_amount_band,
+  function(x) sub(":", " -", x, fixed = TRUE)
+)]
+
+#-----------------------------------------#
+##### Set train / test #####
+#-----------------------------------------#
+
+## Split the dataset into training and testing sets based on the observation year
+## The year 2017 is used as the validation set
+train <- ds[observation_year != 2017]
+test  <- ds[observation_year == 2017]
+
+## Subset the data for prototyping purposes
+## This code block is executed if a prototype subset is requested
+if (prototype) {
+  ## Set the seed for reproducibility
+  set.seed(nTrainSeed)
+  
+  ## Shuffle and select a subset of the training data
+  train <- train[sample(1:nrow(train)), ]
+  train <- train[1:prototype_size]
+}
+```
+
+# Models
+
+```{r glm, echo=FALSE, results='asis'}
+## run the 'AnalyticsFramework_GLM.Rmd' file if selected
+if(runGLM) {
+  res <- knitr::knit_child('AnalyticsFramework_GLM.Rmd',quiet=T)
+  cat(res,sep="\n")
+}
+```
+
+```{r lightgbm, echo=FALSE, results='asis'}
+## run the 'AnalyticsFramework_LightGBM.Rmd' file if selected
+if(runLightGBM) {
+  res <- knitr::knit_child('AnalyticsFramework_LightGBM.Rmd',quiet=T)
+  cat(res,sep="\n")
+}
+
+```
+
+```{r glmint, echo=FALSE, results='asis'}
+## run the 'AnalyticsFramework_GLMNet_Int.Rmd' file if selected
+if(runLightGBM && runGLMInt) {
+  int_col <- imp.int2[order(-sumGain)][1:5,Feature]
+  res <- knitr::knit_child('AnalyticsFramework_GLMNet_Int.Rmd',quiet=T)
+  cat(res,sep="\n")
+}
+```
+
+# Comparison of Model Predictions
+
+## Goodness of Fit
+
+It is important to compare model performance on the test dataset. Models tend to fit well on the training data. 
+
+We compute the MSE, MAD, and Poisson deviance for each model on the test dataset. Models with lower values are considered qualitatively better.
+
+Across all measures, the elastic net GLM model has the lowest deviation, with the LightGBM qualitatively not far behind. The main-effects GLM does not compete, which reinforces the need for some accommodation of interactions.
+
+```{r modelmetrics, warning=FALSE,message=FALSE}
+
+#-----------------------------------------#
+##### Table of Results #####
+#-----------------------------------------#
+
+## creates a table of results for mse, mae, dev for the models
+
+rbind(test[,val(get(resp_var),predictions_glm,get(resp_offset))],
+                 test[,val(get(resp_var),predictions_glmnet,get(resp_offset))],
+                 test[,val(get(resp_var),predictions_lgbm1,get(resp_offset))]) %>%
+  set_rownames(c("glm","glmnet","lgbm")) %>%
+  rownames_to_column(var="model") %>%
+  as.data.table() %>%
+  as_flextable()
+
+```
+
+## Graphical Model Comparison {.tabset}
+
+Unlike the GLM, neither the LightGBM nor the penalized GLM provide any information regarding parameter uncertainty. For elastic net GLMs, there are options to estimate parameter uncertainty: 
+
+1. Move to a fully Bayesian setting. This gives the modeler significant control, at the cost of complexity (e.g., how to choose reasonable priors) and computation cost. Stan and INLA are available for this purpose.
+2. Apply the method in Tibshirani et al's [A significance test for the lasso](https://arxiv.org/abs/1301.7161). This requires rerunning penalized GLMs and is thus potentially costly.
+3. Apply the method in Lederer's [Fundamentals of High-Dimensional Statistics](https://johanneslederer.com/hdbook/), Sec. 5.2. While technically involved, there does not seem to be a heavy computational lift.
+
+To get around the limitations of assessing uncertainty for now, we plot the models versus the envelope of uncertainty arising from the data itself. This shifts the point of view from assessing parameter uncertainty to assessing goodness-of-fit.
+
+Below are plots of how the model performs versus marginal effects, with performance tested on the test subset. Black dots with error bars are from the actual-to-2015VBT ratio, with error bar width based on the dispersion from the GLM model. (Caution: this is at best a crude approximation.)
+
+The following colors denote specific predictive model ratios versus the 2015 VBT:
+
+- Red uses GLM predicted claims
+- Blue uses predicted claims from the elastic net GLM
+- Green uses LightGBM predicted claims
+
+Broad observations:
+
+- In 2017, some of the average relationships shifted versus 2013-2016. This can be seen by noting the model dots resting outside the error bars.
+- The elastic net model may be missing some higher order interactions.
+
+```{r modelfeatureplots, out.width='90%', warning=FALSE, message=FALSE, results='asis'}
+
+#-----------------------------------------#
+##### Model Feature Plots #####
+#-----------------------------------------#
+
+## Select the top `nUseTopLightGBMInteractions` interactions from `imp.int2`
+## and transform the `Feature1` and `Feature2` columns into a long format,
+## ensuring each feature appears only once in the resulting list.
+
+imp.int2 %>% 
+  head(nUseTopLightGBMInteractions) %>%           # Select the top interactions
+  select(Feature1, Feature2) %>%                  # Select the relevant columns
+  pivot_longer(cols = c(Feature1, Feature2),      # Pivot to long format
+               names_to = NULL,
+               values_to = "Feature") %>%        
+  distinct() %>%                                  # Remove duplicate features
+  pull(Feature) -> int.subset                     # Extract the features into `int.subset`
+
+## Calculate the dispersion of the GLM model
+glm_disp <- sum(modelGLM$residuals^2 * modelGLM$weights)/modelGLM$df.residual
+
+## Select the top `nUseTopLightGBMInteractions` interactions from `imp.int2` again
+## to use as input for the `map2` function
+int.subset <- imp.int2 %>% 
+  head(nUseTopLightGBMInteractions) %>%
+  select(Feature1,Feature2)
+
+## Apply a function to each pair of features in `int.subset` to generate plots
+map2(
+  .x = int.subset$Feature1,                       # First feature in the pair
+  .y = int.subset$Feature2,                       # Second feature in the pair
+  .f = function(s1, s2) {                         # Function to apply
+    test[,                                        # Subset the data
+         .(
+           predicted_glm   = sum(predictions_glm)/sum(amount_2015vbt),
+           predicted_glmnet= sum(predictions_glmnet)/sum(amount_2015vbt),
+           predicted_lgbm1 = sum(predictions_lgbm1)/sum(amount_2015vbt),
+           a_e             = sum(amount_actual)/sum(amount_2015vbt),
+           stde            = sqrt(sum(amount_actual)*glm_disp)/sum(amount_2015vbt)
+         ),
+         by=c(s1,s2)]  %>%
+      setnames(s1,"x") %>%
+      setnames(s2,"byvar") %>%
+      mutate(
+        x = fct_relevel(
+          x,
+          sort(levels(x))
+        ),
+        byvar = fct_relevel(
+          byvar,
+          sort(levels(byvar))
+        )
+      ) %>%
+      as.data.table() %>%
+     ggplot(aes(x = x, y = a_e)) +                # Create a ggplot with `x` on the x-axis and `a_e` on the y-axis
+      facet_wrap(vars(byvar)) +                   # Create separate panels for each value of `byvar`
+      geom_point() +                              # Add points for actual values
+      geom_errorbar(aes(ymin = a_e - 1.96 * stde, ymax = a_e + 1.96 * stde)) + # Add error bars
+      geom_hline(yintercept = 1, linetype = 2) +  # Add a horizontal line at y = 1
+      geom_point(aes(y = predicted_glm), color = "red") +   # Add points for GLM predictions
+      geom_point(aes(y = predicted_glmnet), color = "blue") + # Add points for GLMNet predictions
+      geom_point(aes(y = predicted_lgbm1), color = "green") + # Add points for LightGBM predictions
+      scale_y_continuous(name = "Factor", labels = scales::percent, trans = "log") + # Log scale for y-axis
+      scale_x_discrete(name = s1) +               # Name the x-axis after the first feature
+      theme_minimal() +                           # Use a minimal theme
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))  # Rotate x-axis labels
+  }
+) %>%
+  purrr::set_names(
+    int.subset %>% 
+      mutate(Features=paste0( Feature1, " x ", Feature2)) %>% 
+      select(Features) %>%
+      unlist
+    ) %>%
+  iwalk(~ {
+    cat('### ', .y, '\n\n')   # Print the feature pair as a section header
+    print(.x)                 # Print the plot
+    cat('\n\n')               # Add some spacing
+  } )
+
+```
+
+# Mortality Differences by Product Use Case
+
+## Observations from the Raw Data
+
+When assessing differences by product, it is not hard to find challenges when looking at the raw, unadjusted data.
+
+One example is that there is virtually no 4-class non-smoker exposure in Perm, while there is significant exposure in Term. This implies that there is a potential issue of identifiability in interactions between insurance plan and underwriting due to the imbalance in exposures. This manifests as an apparent instability in calibrations.
+
+For example, the marginal difference between the 4-class and 2-class non-smokers in the data is 82.42% (78.2%/94.9%), while the marginal difference between Term and Perm is 86.5% (83.4%/96.4%).
+
+```{r}
+ds[,
+             c("Smoker_Status","NClasses","Class"):=tstrsplit(uw,"/")]
+
+ds[Smoker_Status=="N",.(A_2015VBT=sum(get(resp_var))/sum(get(resp_offset))),
+   by=.(NClasses)][order(NClasses)] %>%
+  flextable() %>%
+  set_header_labels(NClasses="No. of Pref. Classes",
+                    A_2015VBT="A/2015VBT") %>%
+  set_formatter(values = function(x) {
+        if(is.numeric(x))
+          sprintf( "%.1f%%", x*100 )
+        else
+          x
+        }
+        )
+
+ds[,.(A_2015VBT=sum(get(resp_var))/sum(get(resp_offset))),by=.(insurance_plan)] %>%
+  flextable() %>%
+  set_header_labels(insurance_plan="Insurance Plan",
+                    A_2015VBT="A/2015VBT") %>%
+  set_formatter(values = function(x) {
+        if(is.numeric(x))
+          sprintf( "%.1f%%", x*100 )
+        else
+          x
+        }
+        )
+```
+
+By way of comparison, the GLM calibrates `r scales::percent(exp(modelGLM$coefficients["insurance_planTerm"] - modelGLM$coefficients["insurance_planPerm"]),accuracy = .1)` for Term versus Perm, and the weighted average factors for 4-class systems from the GLM model is `r scales::percent(train[uw %like% "N/4",sum(predictions_glm)/sum(amount_2015vbt)],accuracy=.1)` versus `r scales::percent(train[uw %like% "N/2",sum(predictions_glm)/sum(amount_2015vbt)],accuracy=.1)` for 2-class, for a ratio of `r scales::percent(train[uw %like% "N/4",sum(predictions_glm)/sum(amount_2015vbt)]/train[uw %like% "N/2",sum(predictions_glm)/sum(amount_2015vbt)],accuracy=.1)`. The main effects GLM is therefore asserting that both conditions are associated with lower mortality.
+
+For the elastic net GLM, the situation is complicated. All in, there are 52 factors which mention insurance plan, and assessing when perm and term differ is challenging on a bare reading of the factor table.
+
+```{r eval=FALSE}
+reformatCoefs(cvfit, pred_cols)  %>%
+  filter(Coef != 0) %>%
+  select(Feature1Name,
+         Feature1Level,
+         Feature2Name,
+         Feature2Level,
+         Coef) %>%
+  mutate(Coef=exp(Coef)) %>%
+  filter(
+    Feature1Name == "insurance_plan" | Feature2Name == "insurance_plan"
+  ) %>%
+  select(Feature2Name, Feature2Level,
+         Feature1Name, Feature1Level,
+         Coef) %>%
+  arrange(Feature2Name, Feature2Level,
+         Feature1Name, Feature1Level) %>%
+  flextable() %>%
+  set_header_labels(Coef="Factor") %>%
+  set_formatter(values = function(x) {
+        if(is.numeric(x))
+          sprintf( "%.1f%%", x*100 )
+        else
+          x
+        }
+        )
+
+```
+
+For the LightGBM model, there is arguably no interesting mean difference for between Perm and Term.
+
+```{r}
+data.table(
+    insurance_plan=train[shp_int_subset,insurance_plan],
+    shap=shp$S[,which(names(shp$X)=="insurance_plan")] + shp$baseline,
+    response=train[shp_int_subset,get(resp_var)],
+    offset=train[shp_int_subset,get(resp_offset)]
+) %>%
+  group_by(insurance_plan) %>%
+  summarize(M_T=sum(exp(shap)*offset)/sum(offset)) %>%
+  flextable() %>%
+  set_header_labels(insurance_plan="Insurance Plan",
+                    M_T="Model / 2015VBT") %>%
+  set_formatter(values = function(x) {
+        if(is.numeric(x))
+          sprintf( "%.1f%%", x*100 )
+        else
+          x
+        }
+        )
+```
+
+For class system, the LightGBM model is illustrating a substantial reduction in mean mortality for the 4-class systems relative to 2-class systems.
+
+```{r}
+shaps.uw <- data.table(
+    uw=train[shp_int_subset,uw],
+    shap=shp$S[,"uw"] + shp$baseline,
+    response=train[shp_int_subset,get(resp_var)],
+    offset=train[shp_int_subset,get(resp_offset)]
+) 
+
+shaps.uw[,
+             c("Smoker_Status","NClasses","Class"):=tstrsplit(uw,"/")]
+
+shaps.uw %>%
+  group_by(NClasses) %>%
+  summarize(M_T=sum(exp(shap)*offset)/sum(offset)) %>%
+  flextable() %>%
+  set_header_labels(NClasses="No. of Pref. Classes",
+                    M_T="Model / 2015VBT") %>%
+  set_formatter(values = function(x) {
+        if(is.numeric(x))
+          sprintf( "%.1f%%", x*100 )
+        else
+          x
+        }
+        )
+```
+
+All of this strongly suggests the need for more sophisticated analysis.
+
+## Observations from the GLM
+
+One question of interest to actuaries is why different products have different mortality outcomes. Many things could contribute to the difference, such as UW practice, anti-selection risk level, market segment, etc., and generally, it is hard to quantify their impact. With the GLM model and relevant analysis, we have a possible solution.
+
+Let us revisit the table output with insurance plan as the predictor of interest.
+
+```{r PermVsTerm, message = FALSE, warning = FALSE}
+## function that calls individual predictor, e.g., insurance plans. 
+mainF(df     = ds,
+      model  = modelGLM,
+      rf     = "insurance_plan",
+      resp   = resp_var,
+      offset = resp_offset) %>%
+  flextable() %>%
+  set_header_labels("rowname" = "") %>%
+  set_formatter(values = ~ if(is.numeric(.)) sprintf("%.1f%%", . * 100) else .) %>%
+  set_caption(caption = paste0("Weighted Average GLM Factors for Variable: insurance_plan"))
+```
+
+For illustration, let us select Perm and Term for pairwise comparison. By A/15VBT, Perm (96.4%) seems to have better mortality than Term (83.4%). Is this due to "product differences"? 
+
+```{r GLM-BH-Insurance-Plan, message = FALSE, warning = FALSE}
+mainF(df = ds, 
+      model  = modelGLM, 
+      rf     = "insurance_plan", 
+      resp   = resp_var, 
+      offset = resp_offset) %>%
+  select(rowname, Perm, Term) %>%
+  flextable() %>%
+  set_header_labels("rowname" = "") %>%
+  set_formatter(values = ~ if(is.numeric(.)) sprintf("%.1f%%", . * 100) else .) %>%
+  set_caption(caption = paste0("Weighted Average GLM Factors for Variable: insurance_plan in (Perm, Term)"))
+```
+
+Thanks to the GLM model, we can work with a multiplicative formula for prediction. And, with this elegant structure, we can parse out the impact of each individual predictor and make comparisons. The relative impact is represented by the rate of change.
+
+Of these, the movement in uw is the most influential, with ratio 111.9% for Perm over Term. This means that, if all the other predictors are controlled, the average uw factor on a risk-adjusted basis will make Perm mortality prediction approximately 11.9% higher than that of Term. Other influential drivers from this analysis include face amount band, issue year band, and level term period. This may suggest, if actuaries/modelers want to build a simpler model yet still capture essential impact to mortality outcome, they may consider including at least those predictors in the GLM model. 
+
+One should nonetheless look to residuals and distributions to ensure that valuable interactions are not being lost. Part of what we are seeing has to do with the different distributions between Perm and Term of uw and face_amount_band. Perm tends to favor 1- and 2-class risk class systems, while Term tends to favor 3- and 4-class systems. Perm also tends to favor lower face amounts, while Term favors higher face amounts.
+
+```{r by-product-distribution, message = FALSE, warning = FALSE}
+
+## create histogram of 2015 VBT Tabular Claims by Count and UW
+ds %>%
+  filter(insurance_plan %in% c("Perm","Term")) %>%
+  group_by(uw,
+           insurance_plan) %>%
+  summarize(
+            AM_policy=sum(policy_actual)/sum(predictions_glm),
+            policy_2015vbt=sum(policy_2015vbt)) %>%
+  as.data.table() %>%
+  ggplot(aes(x = uw)) +
+    geom_bar(aes(y = policy_2015vbt), stat = "identity") +
+    facet_wrap(facets = vars(insurance_plan)) +
+    scale_y_continuous(labels = scales::number, name = "2015 VBT Tabular Claims by Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45))
+
+## create histogram of 2015 VBT Tabular Claims by Count and Face Amount
+ds %>%
+  filter(insurance_plan %in% c("Perm","Term")) %>%
+  group_by(face_amount_band,
+           insurance_plan) %>%
+  summarize(
+            AM_policy=sum(policy_actual)/sum(predictions_glm),
+            policy_2015vbt=sum(policy_2015vbt)) %>%
+  as.data.table() %>%
+  ggplot(aes(x = face_amount_band)) +
+    geom_bar(aes(y = policy_2015vbt), stat = "identity") +
+    facet_wrap(facets = vars(insurance_plan)) +
+    scale_y_continuous(labels = scales::number, name = "2015 VBT Tabular Claims by Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+In light of what we see for distribution, it is unsurprising that the model fits poorly for the Term subset for smaller face amounts and 1- and 2-class systems, while the model fits the Perm subset poorly for 3- and 4-class systems. Since Perm tends to dominate the lower face amounts, model fit is not nearly as poor there as for the Term subset.
+
+```{r by-product-residuals, message = FALSE, warning = FALSE}
+
+## Create graph of Residuals of Actuals versus Count-based Model by UW
+
+ds %>%
+  filter(insurance_plan %in% c("Perm","Term")) %>%
+  group_by(uw,
+           insurance_plan) %>%
+  summarize(
+            AM_policy=sum(amount_actual)/sum(predictions_glm),
+            policy_actual=sum(amount_actual),
+            predictions_glm=sum(predictions_glm),
+            amount_2015vbt=sum(amount_2015vbt)) %>%
+  as.data.table() %>%
+  ggplot(aes(x = uw)) +
+    geom_point(aes(y = policy_actual / amount_2015vbt), color = "red") +
+    geom_point(aes(y = AM_policy, group = 1)) +
+    geom_errorbar(aes(ymin = AM_policy - 1.96 * sqrt(glm_disp / predictions_glm), ymax = AM_policy + 1.96 * sqrt(glm_disp / predictions_glm))) +
+    geom_hline(yintercept = 1, color = "blue", linetype = 2) +
+    facet_wrap(facets = vars(insurance_plan)) +
+    scale_y_continuous(labels = scales::percent, name = "Actual-to-Model Ratio") +
+    ggtitle("Residuals of Actuals versus Count-based Model") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+## Create graph of Residuals of Actuals versus Count-based Model by Face Amount
+
+ds %>%
+  filter(insurance_plan %in% c("Perm","Term")) %>%
+  group_by(face_amount_band,
+           insurance_plan) %>%
+  summarize(
+            AM_policy=sum(amount_actual)/sum(predictions_glm),
+            policy_actual=sum(amount_actual),
+            predictions_glm=sum(predictions_glm),
+            amount_2015vbt=sum(amount_2015vbt)) %>%
+  as.data.table() %>%
+  ggplot(aes(x = face_amount_band)) +
+    geom_point(aes(y = policy_actual / amount_2015vbt), color = "red") +
+    geom_point(aes(y = AM_policy, group = 1)) +
+    geom_errorbar(aes(ymin = AM_policy - 1.96 * sqrt(glm_disp / predictions_glm), ymax = AM_policy + 1.96 * sqrt(glm_disp / predictions_glm))) +
+    geom_hline(yintercept = 1, color = "blue", linetype = 2) +
+    facet_wrap(facets = vars(insurance_plan)) +
+    scale_y_continuous(labels = scales::percent, name = "Actual-to-Model Ratio") +
+    ggtitle("Residuals of Actuals versus Count-based Model") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Fitting a main-effects GLM on a dataset is a frequently used first step when modeling any dataset. Analyzing residuals from this model and assessing parameter variability by subgroup can reveal useful patterns for further analysis. It is often the case that interactions of effects are present. While a useful starting point, main-effects models cannot capture such interactions effectively. It is therefore necessary to turn to richer models and approaches.
+
+## Observations from the Gradient Boosted Decision Tree {.tabset}
+
+Below are box plots of SHAP values for insurance_plan by the other variables.
+
+```{r lgbm-feature-plot-insurance-plan2, message=FALSE, warning=FALSE, out.width='90%',results='asis'}
+
+imp.int2["insurance_plan" == Feature1 | "insurance_plan" == Feature2] %>% 
+    head(nPlotTopInteractions) %>%
+    select(Feature1,Feature2) %>%
+    pivot_longer(cols=c(Feature1,Feature2),
+                 names_to=NULL,
+                 values_to="Feature") %>%
+    distinct() %>%
+    filter(Feature != "insurance_plan") -> 
+    int.vars
+
+plist <- ilec_shap_plot(
+    shp,
+    "insurance_plan",
+    setdiff(pred_cols,"insurance_plan"),
+    resp_var = resp_var,
+    resp_offset = resp_offset,
+    train.data = train[shp_int_subset]
+  )
+
+
+plist %>%
+  iwalk(~ {
+    cat('### ',.y,'\n\n')
+    print(.x)
+    cat('\n\n')
+  } )
+```
+
+We have noted the interactions with insurance plan from the LightGBM SHAP values as follows:
+
+1. Main Effect: Perm and Term shap distributions are qualitatively similar, with the xL class higher.
+2. Interaction with underwriting:
+    a. Substantial interaction with the "Other" category
+    b. For Term, some evidence of higher mortality for N/4/3 and N/4/4
+3. Interaction with face amount band:
+    a. No obvious interactions with Perm and Term
+    b. Weak evidence for interaction with xL, based on U-shaped pattern in boxplots
+4. Interaction with duration
+    a. Weak evidence for elevated mortality in early durations for Perm
+    b. Weak evidence for opposite in early durations for Term
+    c. Face amounts 1 million and higher for "Other" are plainly different from lower face amount "Other"
+5. Interaction with issue age
+    a. Evidence for different issue age slope (relative to 2015VBT) for xL based on downward trend in boxplots
+    b. Weak evidence for slight upward issue age slope (relative to 2015VBT) for Term based on trend in boxplots
+6. Interaction with gender: no obvious interaction
+7. Interaction with level term period:
+    a. Obviously, no interactions outside of Term
+    b. Within Term, "Not Level Term" has lower mortality than the other level term types
+8. Interaction with issue year band:
+    a. Since 1990, there is evidence of an upward trend in mortality for all categories outside of "Other".
+
+## Contrasts of Interactions with Insurance Plan from the Elastic Net Model {.tabset}
+
+The elastic net model encodes interesting interactions of insurance plan with other predictor variables. Graphing the contrast between insurance plan types can reveal patterns which are difficult to see when looking at the bare coefficients or tables of factors.
+
+To do so, we can gather the table of factors which include insurance plan and compute the ratio of the factors versus the factors for term. For example, if the marginal factor for Perm males is 99%, and the factor for Term males is 90%, then the ratio is 110%. These contrasts can then be plotted for both males and females across the plan comparisons, as can be seen in the following graphs.
+
+```{r message=FALSE, results='asis'}
+
+## Combine the list of glmnet interactions into a data.table and filter relevant interactions
+data.table(do.call(rbind, glmnet.int.list)) %>%
+  filter((Feature1Name == "insurance_plan" | Feature2Name == "insurance_plan") &
+         (Feature1Name != "ltp" & Feature2Name != "ltp")) ->
+  ints.with.plan
+
+## Extract interaction feature names related to "insurance_plan"
+c(ints.with.plan[Feature1Name == "insurance_plan", Feature2Name],
+  ints.with.plan[Feature2Name == "insurance_plan", Feature1Name]) ->
+  ints.with.plan
+
+## Map over each interaction feature
+ints.with.plan %>%
+  map(
+    .f = \(x) {
+      symx <- sym(x)  # Convert feature name to symbol
+
+      ## Create a table of coefficients for the interaction with "insurance_plan"
+      tableCVNetCoefs(train.grid,
+                      c(x, "insurance_plan"),
+                      "Factor",
+                      pred_cols,
+                      levellist = list("dur_band1" = "04-05")) %>%
+        data.table() ->
+        tblFacts
+
+      ## Normalize factors by "Term" and pivot longer for ggplot
+      cbind(
+        tblFacts[, 1],
+        tblFacts[, lapply(.SD, "/", Term), .SDcols = colnames(tblFacts)[-1]]
+      ) %>%
+        pivot_longer(
+          cols = colnames(tblFacts)[-1],
+          values_to = "Factor",
+          names_to = "comparison"
+        ) %>%
+        filter(comparison != 'Term') %>%
+        mutate(comparison = paste0(comparison, " vs. Term")) %>%
+        data.table() ->
+        dftmp
+
+      ## Special handling if the feature is "uw"
+      if (x == "uw") {
+        dftmp %>%
+          separate(
+            col = uw,
+            into = c("Smoker_Status", "NClasses", "Class"),
+            sep = "/",
+            remove = FALSE
+          ) ->
+          dftmp
+
+        ## Filter out single class and plot
+        dftmp %>%
+          filter(NClasses != 1) %>%
+          ggplot(aes(x = Class, y = Factor)) +
+          geom_line(aes(group = comparison, color = comparison)) +
+          scale_y_continuous(labels = scales::percent) +
+          facet_wrap(Smoker_Status ~ NClasses, labeller = label_both) +
+          theme_minimal() +
+          ggtitle(
+            "Ratio of Insurance Plan Factor to Term Insurance Plan Factor",
+            subtitle = paste0("by ", ints.with.plan[3])
+          ) -> p
+      } else {
+        ## General plot for other features
+        dftmp %>%
+          ggplot(aes(x = !!symx, y = Factor)) +
+          geom_line(aes(group = comparison, color = comparison)) +
+          scale_y_continuous(labels = scales::percent) +
+          theme_minimal() +
+          ggtitle(
+            "Ratio of Insurance Plan Factor to Term Insurance Plan Factor",
+            subtitle = paste0("by ", x)
+          ) +
+          theme(axis.text.x = element_text(angle = ifelse(x == "face_amount_band", 45, 0))) +
+          scale_color_viridis_d() -> p
+      }
+
+      p  # Return the plot
+    }
+  ) %>%
+  purrr::set_names(ints.with.plan) %>%
+  iwalk(~ {
+    cat('### ', .y, '\n\n')
+    print(.x)
+    cat('\n\n')
+  })
+
+
+```
+
+## {-}
+
+- It appears that the gap between UL/VL/ULSG/VLSG and term has been narrowing with increasing issue year.
+- xL and Other tend to have a wider spread of factors for face amount than term, while perm has a narrower spread of face amount factors than term.
+- Perm and xL tend to have flatter slope than Term by issue age, except above issue age 65. Above issue age 65, the slope of Perm and xL diverge.
+- Perm tends to have higher duration 2 experience than others.
+- The gender differential for males is narrower for Perm than for term.
+
+A different view helps illustrate the interactions of underwriting and insurance plan. It is easier to see in this view that
+
+- The residual standard class of a 2-class non-smoker system for Term is much higher than the others. 
+- The spread for Term and xL in the 4-class non-smoker system is wider than for Perm and Other.
+
+```{r message=FALSE}
+
+## Create graph of interaction of Underwriting and Insurance Plan
+
+tableCVNetCoefs(train.grid,
+                c("uw", "insurance_plan"),
+                "Factor",
+                pred_cols,
+                levellist = list("dur_band1" = "04-05")) %>%
+  pivot_longer(cols = c("Perm", "Term", "Other", "xL"), values_to = "Factor", names_to = "insurance_plan") %>%
+  separate(col = uw, into = c("Smoker_Status", "NClasses", "Class"), sep = "/", remove = FALSE) %>%
+  data.table() -> tblFacts
+
+
+tblFacts %>%
+  ggplot(aes(x = insurance_plan, y = Factor)) +
+    geom_line(aes(group = Class, color = Class)) +
+    facet_wrap(Smoker_Status ~ NClasses, labeller = label_both) +
+    theme_minimal() +
+    scale_y_continuous(labels = scales::percent) +
+    scale_color_viridis_d() +
+    ggtitle(
+      "Interaction of Underwriting and Insurance Plan",
+      subtitle = "from the elastic net model"
+    )
+```
+
+# Summary
+
+In this analysis, we explored the application of a predictive modeling framework within actuarial experience studies, focusing on mortality differences by product type in the ILEC dataset. Our analysis revealed several key insights and mortality differentials that can be useful to understand drivers of mortality. This framework and the findings demonstrated the use and considerations required of predictive modeling and underscore its value in making informed actuarial decisions.
+
+# Acknowledgements
+
+## Working Group Members
+
+This framework is the result of the tireless efforts of members of the Individual Life Experience Committee, including
+
+- Philip Adams, FSA (chair)
+- Cynthia Edwalds, FSA
+- Brian Holland, FSA
+- Ed Hui, FSA
+- Michael Niemerg, FSA
+- Haofeng Yu, FSA
+
+## Society of Actuaries
+
+The authors would like to thank the staff of the Society of Actuaries for their help throughout this project. Many thanks to Korrel Crawford and Pete Miller.
+
+# Appendices
+
+## Computational Requirements
+
+```{r}
+## view session info for documentation purposes
+sessionInfo()
+```
+
+# References
