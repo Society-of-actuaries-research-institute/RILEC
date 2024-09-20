@@ -712,7 +712,7 @@ mainF(df     = ds,
   set_caption(caption = paste0("Weighted Average GLM Factors for Variable: insurance_plan"))
 ```
 
-For illustration, let us select Perm and Term for pairwise comparison. By A/15VBT, Perm (96.4%) seems to have better mortality than Term (83.4%). Is this due to "product differences"? 
+For illustration, let us select Perm and Term for pairwise comparison. By A/15VBT, Perm (96.4%) seems to have worse mortality than Term (83.4%). Is this due to "product differences"? 
 
 ```{r GLM-BH-Insurance-Plan, message = FALSE, warning = FALSE}
 mainF(df = ds, 
